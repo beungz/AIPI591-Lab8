@@ -39,6 +39,12 @@ def make_video_logger(output_dir, episode_num):
         def add_frame(self, frame):
             """Add frame to video"""
             if frame.dtype == np.uint8:
+                if frame.shape[-1] == 1:  # grayscale (e.g. atari config)
+                    frame = np.repeat(frame, 3, axis=-1)
+                # Upscale small frames (64x64 / 96x96) so the video is viewable
+                scale = max(1, 384 // max(frame.shape[:2]))
+                if scale > 1:
+                    frame = frame.repeat(scale, axis=0).repeat(scale, axis=1)
                 frames.append(frame)
 
         def save(self, name=None):
@@ -145,22 +151,30 @@ def inference_with_video(
         print(f"Episode {ep + 1}/{num_episodes}")
         video_logger = make_video_logger(output_dir, ep)
 
-        # Reset environment and agent
-        obs = env.reset()
+        # Reset environment and agent. Embodied envs have no reset(); they
+        # reset through step() with reset=True and an all-zero action.
+        reset_act = {
+            k: np.zeros(v.shape, v.dtype)
+            for k, v in env.act_space.items() if k != 'reset'}
+        obs = env.step({**reset_act, 'reset': np.array(True)})
         carry = agent.init_policy(batch_size=1)
 
         episode_reward = 0
         episode_length = 0
 
+        if 'image' in obs and render:
+            video_logger.add_frame(obs['image'])
+
         for step in range(max_steps):
             # Convert observation to batch format
-            obs_batch = {k: v[None, ...] for k, v in obs.items()}
+            obs_batch = {k: np.asarray(v)[None, ...] for k, v in obs.items()}
 
             # Agent decision
             carry, action, _ = agent.policy(carry, obs_batch, mode='eval')
 
-            # Extract action (remove batch dimension)
-            action = {k: v[0] for k, v in action.items()}
+            # Extract action (remove batch dimension) and keep reset=False
+            action = {k: np.asarray(v)[0] for k, v in action.items()}
+            action['reset'] = np.array(False)
 
             # Environment step
             obs = env.step(action)
@@ -169,7 +183,7 @@ def inference_with_video(
             if 'image' in obs and render:
                 video_logger.add_frame(obs['image'])
 
-            episode_reward += obs.get('reward', 0)
+            episode_reward += float(obs.get('reward', 0))
             episode_length += 1
 
             # Check if done
